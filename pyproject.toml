@@ -1,0 +1,21 @@
+[project]
+name = "acc-system-agent"
+version = "0.1.0"
+description = "Read-only document analysis boundary for the accounting system"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "fastapi>=0.117,<1",
+  "httpx>=0.28,<1",
+  "pydantic-settings>=2.10,<3",
+  "uvicorn[standard]>=0.35,<1",
+]
+
+[dependency-groups]
+dev = ["pytest>=8,<10"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.uv]
+package = false
