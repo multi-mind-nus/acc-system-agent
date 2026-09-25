@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     novita_api_key: SecretStr = SecretStr("")
     agent_api_key: SecretStr = SecretStr("")
     model_connect_timeout_seconds: float = Field(default=10, gt=0, le=30)
-    model_request_timeout_seconds: float = Field(default=180, gt=0, le=300)
+    model_request_timeout_seconds: float = Field(default=300, gt=0, le=300)
 
     @field_validator("model_api_url", "model_health_url", "ocr_api_url", "ocr_health_url")
     @classmethod

@@ -1,5 +1,6 @@
 """Backend–Agent REVIEW contract. Keep identical in both repositories."""
 from datetime import date
+from decimal import Decimal
 from typing import Annotated, Literal
 from uuid import UUID
 
@@ -141,6 +142,7 @@ class Finding(StrictModel):
     period_check: Literal["MATCH", "MISMATCH", "UNKNOWN"]
     explanation: str = Field(min_length=1, max_length=2000)
     client_message: str | None = Field(default=None, max_length=2000)
+    requested_document_type: str | None = Field(default=None, max_length=64)
     evidence: list[Evidence] = Field(max_length=100)
     amounts: list[AmountRelation] = Field(default_factory=list, max_length=50)
 
@@ -152,6 +154,9 @@ class Finding(StrictModel):
             raise ValueError("Resolution requires supporting evidence")
         if self.action == "ESCALATE" and self.suggested_decision is not None:
             raise ValueError("Escalation is not a decision")
+        if self.action == "ASK_CLIENT" and self.issue_code in ("MISSING", "INCOMPLETE") \
+                and not self.requested_document_type:
+            raise ValueError("Missing support must name the requested document type")
         ids = [e.document_id for e in self.evidence]
         if len(ids) != len(set(ids)) or any(o.document_id not in ids for a in self.amounts for o in a.operands):
             raise ValueError("Invalid amount evidence")
@@ -167,6 +172,59 @@ class ReviewResponse(StrictModel):
     search: Search | None = None
 
 
+def _validate_expense_receipts(body: ReviewRequest, output: ReviewResponse) -> None:
+    if output.search:
+        return
+    receipt_requirements = {r.id for r in body.requirements if r.document_type == "RECEIPT"}
+    extractions = {row.document_id: row for row in output.extractions}
+    document_types = {doc.document_id: doc.document_type or (extractions[doc.document_id].document_type
+                      if doc.document_id in extractions else None) for doc in body.documents}
+    claims = [doc.document_id for doc in body.documents if document_types[doc.document_id] == "EXPENSE_CLAIM"]
+    if not claims:
+        return
+    claim_requirements = {r.id for r in body.requirements if r.document_type == "EXPENSE_CLAIM"}
+    relevant = [finding for finding in output.findings if finding.suggested_decision == "SATISFY" and (
+        finding.requirement_id in receipt_requirements | claim_requirements
+        or any(e.document_id in claims for e in finding.evidence))]
+    if not relevant:
+        return
+    receipts = [doc.document_id for doc in body.documents if document_types[doc.document_id] == "RECEIPT"]
+    used = set()
+    matched_by_claim = {}
+    for claim_id in claims:
+        claim = extractions.get(claim_id)
+        if not claim or not claim.amount or not claim.currency or not claim.transactions:
+            raise ValueError("Expense claim needs itemized lines before automatic satisfaction")
+        if any(row.currency != claim.currency or Decimal(row.amount) <= 0 for row in claim.transactions) \
+                or sum(Decimal(row.amount) for row in claim.transactions) != Decimal(claim.amount):
+            raise ValueError("Expense claim lines do not reconcile to its total")
+        matched = set()
+        for line in claim.transactions:
+            receipt_id = next((doc_id for doc_id in receipts if doc_id not in used
+                               and (receipt := extractions.get(doc_id)) and receipt.currency == line.currency
+                               and receipt.amount and Decimal(receipt.amount) == Decimal(line.amount)), None)
+            if receipt_id is None:
+                raise ValueError("Every expense claim line needs a distinct matching receipt")
+            used.add(receipt_id)
+            matched.add(receipt_id)
+        matched_by_claim[claim_id] = matched
+    required_evidence = set(claims) | used
+    if any(not required_evidence <= {e.document_id for e in finding.evidence} for finding in relevant):
+        raise ValueError("Expense claim resolution must cite the claim and every matching receipt")
+    for finding in relevant:
+        if finding.requirement_id not in claim_requirements:
+            continue
+        for claim_id, receipt_ids in matched_by_claim.items():
+            if not any(relation.operation == "SUM" and relation.currency == extractions[claim_id].currency
+                       and len(relation.operands) == len(receipt_ids)
+                       and {operand.document_id for operand in relation.operands} == receipt_ids
+                       and all(Decimal(operand.amount) == Decimal(extractions[operand.document_id].amount)
+                               for operand in relation.operands if operand.document_id in receipt_ids)
+                       and Decimal(relation.expected_amount) == Decimal(extractions[claim_id].amount)
+                       for relation in finding.amounts):
+                raise ValueError("Expense claim total must be reconciled from original receipt amounts")
+
+
 def validate_review(body: ReviewRequest, result: object) -> ReviewResponse:
     output = ReviewResponse.model_validate(result)
     req_ids = {r.id for r in body.requirements}
@@ -179,9 +237,21 @@ def validate_review(body: ReviewRequest, result: object) -> ReviewResponse:
         raise ValueError("Unknown or duplicate extraction")
     if any(e.document_id not in doc_ids for f in output.findings for e in f.evidence):
         raise ValueError("Unknown evidence")
+    requirements_by_type = {}
+    for requirement in body.requirements:
+        requirements_by_type.setdefault(requirement.document_type, set()).add(requirement.id)
+    for finding in output.findings:
+        if finding.action != "ASK_CLIENT" or finding.issue_code not in ("MISSING", "INCOMPLETE"):
+            continue
+        target_requirements = requirements_by_type.get(finding.requested_document_type)
+        if not target_requirements:
+            raise ValueError("Requested document type must exist in the collection requirements")
+        if finding.requirement_id not in target_requirements:
+            raise ValueError("Client action must target the requested document requirement")
     if output.search:
         if output.search.requirement_id not in req_ids or output.findings or body.turn >= 3 or output.search in body.search_history:
             raise ValueError("Search response must not contain final findings")
     elif set(finding_ids) != req_ids or set(extracted_ids) != doc_ids:
         raise ValueError("Final review must cover every input requirement and document")
+    _validate_expense_receipts(body, output)
     return output

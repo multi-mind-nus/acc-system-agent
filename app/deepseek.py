@@ -61,7 +61,7 @@ def _ocr_texts(documents, files: list[bytes], settings: Settings, deadline: floa
                 for index, (doc, content) in enumerate(zip(documents, files, strict=True))]
 
 
-def _flash(system: str, payload: dict, settings: Settings, deadline: float) -> dict:
+def _flash(system: str, payload: dict, settings: Settings, deadline: float, thinking: bool = False) -> dict:
     require_deepseek(settings)
     remaining = deadline - monotonic()
     if remaining <= 0:
@@ -71,6 +71,8 @@ def _flash(system: str, payload: dict, settings: Settings, deadline: float) -> d
         {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)},
     ], "response_format": {"type": "json_object"},
         "temperature": 0, "max_tokens": 16384, "stream": False}
+    if thinking:
+        request["reasoning"] = {"effort": "low"}
     try:
         started = perf_counter()
         with httpx.Client(timeout=httpx.Timeout(remaining, connect=min(settings.model_connect_timeout_seconds, remaining)), follow_redirects=False, trust_env=False) as client:
@@ -88,6 +90,12 @@ def _flash(system: str, payload: dict, settings: Settings, deadline: float) -> d
                 envelope = httpx.Response(200, content=bytes(raw)).json()
                 choice = envelope["choices"][0]
                 if choice.get("finish_reason") != "stop":
+                    message = choice.get("message") or {}
+                    event("model_output_incomplete", run_id=payload["run_id"], turn=payload.get("turn"),
+                          finish_reason=choice.get("finish_reason"),
+                          completion_tokens=(envelope.get("usage") or {}).get("completion_tokens"),
+                          content_chars=len(message.get("content") or ""),
+                          reasoning_chars=len(message.get("reasoning_content") or ""))
                     raise AgentError(502, "MODEL_INVALID_RESPONSE",
                                      f"Model output is incomplete ({choice.get('finish_reason')})")
                 content = choice["message"]["content"]
@@ -133,7 +141,7 @@ def classify_with_deepseek(body, files: list[bytes], settings: Settings) -> dict
 
 
 def review_with_deepseek(body, files: list[bytes], settings: Settings) -> dict:
-    deadline = monotonic() + min(170, settings.model_request_timeout_seconds - 10)
+    deadline = monotonic() + min(290, settings.model_request_timeout_seconds - 10)
     documents = []
     for doc, ocr_text in zip(body.documents, _ocr_texts(body.documents, files, settings, deadline, str(body.run_id)), strict=True):
         # Filenames are user-controlled hints and may leak synthetic evaluation labels.
@@ -174,6 +182,18 @@ def review_with_deepseek(body, files: list[bytes], settings: Settings) -> dict:
               "explains the net amount. Cite each material source; do not treat a matching net figure alone as proof "
               "when gross or deductions are documented. An open-items register is a ledger summary, not the underlying "
               "invoice or other source document; do not resolve a payment from bank plus register alone. "
+              "When an EXPENSE_CLAIM is present, extract the claim total and every "
+              "expense line into the claim extraction's transactions. Match each line by amount and currency "
+              "to a distinct original RECEIPT document; the claim's own line item is not a receipt. Only resolve "
+              "the receipts, claim or related bank reconciliation when every line has its own receipt and cite "
+              "the claim and all matching receipts in each related finding. If a receipt is absent, first "
+              "SEARCH_CURRENT; after an unsuccessful search use ASK_CLIENT with INCOMPLETE and name the missing "
+              "support. The expense-claim finding's SUM relation must use each original receipt as a distinct "
+              "operand, not the claim itself. Do not use a matching claim total alone to resolve reimbursement. "
+              "For MISSING or INCOMPLETE, set requested_document_type to the document the client must upload. "
+              "If the requirement list already has that document type, put ASK_CLIENT/REQUEST_ACTION on that "
+              "requirement_id, never on the requirement that merely discovered the gap, and do not mark the target "
+              "requirement SATISFY. Use ESCALATE on the originating reconciliation while it awaits that support. "
               "If an available open-items register explicitly lists the invoice number of a cited source invoice, "
               "cite that register as REFERENCE evidence for the prior-period unpaid status. "
               "Exclude unrelated documents. Never invent amounts, entities, "
@@ -195,7 +215,7 @@ def review_with_deepseek(body, files: list[bytes], settings: Settings) -> dict:
               attempt=attempt + 1, model=settings.model_name)
         started = perf_counter()
         try:
-            result = _flash(prompt, payload, settings, deadline)
+            result = _flash(prompt, payload, settings, deadline, True)
         except AgentError as exc:
             event("model_call_finished", run_id=str(body.run_id), purpose="REVIEW", turn=body.turn,
                   attempt=attempt + 1, status="failed", error_code=exc.code, duration_ms=elapsed_ms(started))
@@ -207,6 +227,9 @@ def review_with_deepseek(body, files: list[bytes], settings: Settings) -> dict:
               attempt=attempt + 1, status="ok", duration_ms=elapsed_ms(started))
         try:
             output = validate_review(body, result)
+            actionable_gap = any(finding.action == "ASK_CLIENT"
+                                 and finding.issue_code in ("MISSING", "INCOMPLETE")
+                                 for finding in output.findings)
             for finding in output.findings:
                 requirement = next(req for req in body.requirements if req.id == finding.requirement_id)
                 if (requirement.analysis_type == "BANK_TRANSACTION_RECONCILIATION"
@@ -214,7 +237,10 @@ def review_with_deepseek(body, files: list[bytes], settings: Settings) -> dict:
                         and finding.issue_code not in ("WRONG_PERIOD", "ENTITY_MISMATCH", "UNREADABLE")
                         and body.turn < 3):
                     searched = {item.action for item in body.search_history}
-                    action = next((value for value in ("SEARCH_CURRENT", "SEARCH_HISTORY") if value not in searched), None)
+                    action = ("SEARCH_CURRENT" if "SEARCH_CURRENT" not in searched
+                              else "SEARCH_HISTORY" if finding.action == "ESCALATE" and not actionable_gap
+                              and "SEARCH_HISTORY" not in searched
+                              else None)
                     if action:
                         event("model_result_validation", run_id=str(body.run_id), turn=body.turn,
                               attempt=attempt + 1, status="search_required")
@@ -275,7 +301,8 @@ def review_with_deepseek(body, files: list[bytes], settings: Settings) -> dict:
         except ValueError as exc:
             event("model_result_validation", run_id=str(body.run_id), turn=body.turn,
                   attempt=attempt + 1, status="failed",
-                  error_code="SCHEMA_INVALID" if isinstance(exc, ValidationError) else "EVIDENCE_INVALID")
+                  error_code="SCHEMA_INVALID" if isinstance(exc, ValidationError) else "EVIDENCE_INVALID",
+                  detail=None if isinstance(exc, ValidationError) else str(exc)[:150])
             reason = "schema" if isinstance(exc, ValidationError) else str(exc)
             if attempt == 2:
                 raise AgentError(502, "MODEL_INVALID_RESPONSE", f"Review response failed validation: {reason}") from None

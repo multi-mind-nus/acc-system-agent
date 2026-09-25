@@ -42,6 +42,7 @@ def mock_review(body: ReviewRequest):
             "entity_check": "MISMATCH" if code == "ENTITY_MISMATCH" else "UNKNOWN", "period_check": "MISMATCH" if code == "WRONG_PERIOD" else "UNKNOWN",
             "explanation": {"WRONG_PERIOD": "The simulated document period differs from the requested period.", "ENTITY_MISMATCH": "The simulated document belongs to a different entity.", "MISSING": "Supporting documents are missing in this simulation."}.get(code, "Simulated supporting evidence found; verify the source documents." if resolved else "No model connected; manual verification required."),
             "client_message": "Please provide documents for the requested period." if code == "WRONG_PERIOD" else "Please provide documents for the correct entity." if code == "ENTITY_MISMATCH" else "Please supply the missing supporting documents." if code else None,
+            "requested_document_type": req.document_type if code == "MISSING" else None,
             "evidence": [{"document_id": str(d.document_id), "relation": "CONTRADICTS" if code else "SUPPORTS", "reason": "Simulated evidence; verify the original document."} for d in supports], "amounts": []}
         if scenario in ("B01", "F02", "F04", "F05") and docs:
             operands, expected = (("1246.02", "1582.78"), "2828.80") if scenario == "B01" else (("120.00", "80.00"), "200.00") if scenario == "F02" else (("1340.00", "10.00"), "1350.00") if scenario == "F04" else (("1000.00", "100.00"), "900.00")

@@ -70,13 +70,56 @@ def test_review_rejects_invalid_output_and_search_round(document):
         ReviewRequest.model_validate({**body.model_dump(mode="json"), "turn": 1})
 
 
+def test_missing_support_targets_its_own_requirement(document):
+    bank_id, bank_requirement, invoice_requirement = uuid4(), uuid4(), uuid4()
+    body = ReviewRequest.model_validate({
+        "run_id": str(uuid4()), "purpose": "REVIEW",
+        "context": {"entity_name": "Demo", "period": "2026-02-01", "submission_id": str(uuid4())},
+        "documents": [{**document.model_dump(mode="json"), "document_id": str(bank_id),
+                       "document_type": "BANK_STATEMENT", "requirement_ids": [str(bank_requirement)]}],
+        "requirements": [
+            {"id": str(bank_requirement), "document_type": "BANK_STATEMENT", "title": "Bank statement",
+             "analysis_type": "BANK_TRANSACTION_RECONCILIATION", "required": True},
+            {"id": str(invoice_requirement), "document_type": "SUPPLIER_INVOICE", "title": "Supplier invoices",
+             "analysis_type": "DOCUMENT_REQUIREMENT_VALIDATION", "required": True},
+        ],
+    })
+    evidence = [{"document_id": str(bank_id), "relation": "REFERENCE", "reason": "Unreconciled payment"}]
+    base = {"schema_version": "1", "run_id": str(body.run_id), "model_version": "test",
+            "extractions": [{"document_id": str(bank_id), "document_type": "BANK_STATEMENT"}]}
+    wrong = {**base, "findings": [
+        {"requirement_id": str(bank_requirement), "action": "ASK_CLIENT", "suggested_decision": "REQUEST_ACTION",
+         "issue_code": "INCOMPLETE", "requested_document_type": "SUPPLIER_INVOICE",
+         "entity_check": "MATCH", "period_check": "MATCH", "explanation": "Invoices are missing",
+         "client_message": "Upload the missing invoices", "evidence": evidence},
+        {"requirement_id": str(invoice_requirement), "action": "RESOLVE", "suggested_decision": "SATISFY",
+         "issue_code": None, "entity_check": "UNKNOWN", "period_check": "UNKNOWN",
+         "explanation": "Incorrectly satisfied", "client_message": None, "evidence": evidence},
+    ]}
+    with pytest.raises(ValueError, match="target the requested document requirement"):
+        validate_review(body, wrong)
+    corrected = deepcopy(wrong)
+    corrected["findings"][0].update(action="ESCALATE", suggested_decision=None,
+                                     requested_document_type=None, client_message=None)
+    corrected["findings"][1].update(action="ASK_CLIENT", suggested_decision="REQUEST_ACTION",
+                                     issue_code="INCOMPLETE", requested_document_type="SUPPLIER_INVOICE",
+                                     explanation="Supplier invoices are missing",
+                                     client_message="Upload the missing supplier invoices")
+    validate_review(body, corrected)
+    absent_target = deepcopy(corrected)
+    absent_target["findings"][1]["requested_document_type"] = "RECEIPT"
+    with pytest.raises(ValueError, match="must exist in the collection requirements"):
+        validate_review(body, absent_target)
+
+
 @pytest.mark.parametrize("preference", ["CAUTIOUS", "STANDARD", "EFFICIENT"])
 def test_review_preference_is_sent_as_trusted_policy(document, monkeypatch, preference):
     body = request_body(document, "ordinary").model_copy(update={"review_preference": preference})
     seen = []
     monkeypatch.setattr(deepseek, "ocr_document", lambda *args: "Readable bank statement")
 
-    def fake_flash(prompt, payload, config, deadline):
+    def fake_flash(prompt, payload, config, deadline, thinking=False):
+        assert thinking is True
         seen.append((prompt, payload))
         return mock_review(body)
 

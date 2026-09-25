@@ -46,6 +46,7 @@ def test_ocr_precedes_flash_and_inline_api_is_standalone(tmp_path, monkeypatch, 
         calls.append("flash")
         assert payload["model"] == "deepseek/test-flash"
         assert payload["max_tokens"] == 16384
+        assert "reasoning" not in payload
         assert request.headers["Authorization"] == "Bearer flash-secret"
         assert "BANK STATEMENT UOB" in payload["messages"][1]["content"]
         assert "content_base64" not in payload["messages"][1]["content"]
@@ -120,6 +121,7 @@ def test_review_uses_ocr_and_cannot_create_business_decisions(tmp_path, monkeypa
             return httpx.Response(200, json={"choices": [{"finish_reason": "stop", "message": {"content": "Invoice period August 2026"}}]})
         payload = json.loads(request.content)
         assert payload["model"] == "deepseek/test-flash"
+        assert payload["reasoning"] == {"effort": "low"}
         prompt = payload["messages"][1]["content"]
         assert "Invoice period August 2026" in prompt
         assert json.loads(prompt)["documents"][0]["submission_round"] == 1
@@ -232,7 +234,8 @@ def test_reconciliation_retries_unproved_or_invalid_amounts(monkeypatch, bad_rel
     prompts = []
     monkeypatch.setattr(deepseek, "ocr_document", lambda *args: "Bank debit SGD 100; invoice SGD 100")
 
-    def fake_flash(prompt, payload, config, deadline):
+    def fake_flash(prompt, payload, config, deadline, thinking=False):
+        assert thinking is True
         prompts.append(prompt)
         return responses[len(prompts) - 1]
 
@@ -291,6 +294,29 @@ def test_missing_bank_support_searches_before_escalation(monkeypatch, searched, 
     assert (result.get("search") or {}).get("action") == expected
 
 
+def test_actionable_missing_current_document_does_not_search_history(monkeypatch):
+    run_id, req_id, doc_id = (str(uuid4()) for _ in range(3))
+    body = ReviewRequest.model_validate({
+        "run_id": run_id, "purpose": "REVIEW", "turn": 1,
+        "context": {"entity_name": "Demo", "period": "2026-08-01", "submission_id": str(uuid4())},
+        "documents": [{"document_id": doc_id, "storage_key": "bank.pdf", "content_type": "application/pdf",
+                       "sha256": "0" * 64, "original_name": "bank.pdf", "requirement_ids": [req_id]}],
+        "requirements": [{"id": req_id, "document_type": "BANK_STATEMENT", "title": "Reconcile payment",
+                          "analysis_type": "BANK_TRANSACTION_RECONCILIATION", "required": True}],
+        "search_history": [{"action": "SEARCH_CURRENT", "requirement_id": req_id}],
+    })
+    response = {"schema_version": "1", "run_id": run_id, "model_version": "test",
+                "extractions": [{"document_id": doc_id}], "findings": [{
+                    "requirement_id": req_id, "action": "ASK_CLIENT", "suggested_decision": "REQUEST_ACTION",
+                    "issue_code": "INCOMPLETE", "entity_check": "MATCH", "period_check": "MATCH",
+                    "explanation": "Current document is missing", "client_message": "Upload the missing document",
+                    "requested_document_type": "BANK_STATEMENT",
+                    "evidence": [{"document_id": doc_id, "relation": "REFERENCE", "reason": "Bank debit"}]}]}
+    monkeypatch.setattr(deepseek, "ocr_document", lambda *args: "Bank debit SGD 100")
+    monkeypatch.setattr(deepseek, "_flash", lambda *args: response)
+    assert deepseek.review_with_deepseek(body, [b"bank"], settings)["findings"][0]["action"] == "ASK_CLIENT"
+
+
 def test_register_alone_cannot_prove_bank_payment(monkeypatch):
     run_id, req_id, bank_id, register_id = (str(uuid4()) for _ in range(4))
     body = ReviewRequest.model_validate({
@@ -316,10 +342,11 @@ def test_register_alone_cannot_prove_bank_payment(monkeypatch):
                                         {"document_id": register_id, "amount": "100", "label": "Open item"},
                                         {"document_id": bank_id, "amount": "-100", "label": "Debit"}],
                                         "expected_amount": "0", "actual_amount": "0", "difference": "0"}]}]}
-    corrected = {**base, "findings": [{"requirement_id": req_id, "action": "ASK_CLIENT",
-                                        "suggested_decision": "REQUEST_ACTION", "issue_code": "INCOMPLETE",
+    corrected = {**base, "findings": [{"requirement_id": req_id, "action": "ESCALATE",
+                                        "suggested_decision": None, "issue_code": "INCOMPLETE",
                                         "entity_check": "MATCH", "period_check": "MATCH",
-                                        "explanation": "Source invoice is absent", "client_message": "Provide the source invoice",
+                                        "explanation": "Source invoice is absent", "client_message": None,
+                                        "requested_document_type": None,
                                         "evidence": evidence}]}
     responses = iter((wrong, corrected))
     monkeypatch.setattr(deepseek, "ocr_document", lambda *args: "Bank debit and open item SGD 100")
