@@ -32,10 +32,29 @@ class ReviewTarget(StrictModel):
     instructions: str = Field(default="", max_length=4000)
 
 
+class ReviewClientFeatures(StrictModel):
+    uses_payment_platform: bool = False
+    has_employee_reimbursement: bool = False
+    has_loan: bool = False
+    multi_currency: bool = False
+    project_based: bool = False
+    has_retention: bool = False
+
+
+class ReviewBankAccount(StrictModel):
+    bank: str = Field(min_length=1, max_length=100)
+    account_last4: str = Field(pattern=r"^[0-9]{4}$")
+    currency: Currency
+
+
 class ReviewContext(StrictModel):
     entity_name: str = Field(min_length=1, max_length=200)
     period: date
     submission_id: UUID
+    industry: str | None = Field(default=None, max_length=40)
+    base_currency: Currency | None = None
+    features: ReviewClientFeatures | None = None
+    bank_accounts: list[ReviewBankAccount] = Field(default_factory=list)
 
 
 class Search(StrictModel):

@@ -13,12 +13,22 @@ from app.schemas import AnalyzeRequest, ClassificationResponse
 from app.storage import read_document
 
 KEYWORDS = {
-    "BANK_STATEMENT": ("bank", "statement", "对账单", "流水"),
-    "PURCHASE_INVOICE": ("purchase", "supplier", "vendor", "采购"),
+    "BANK_STATEMENT": ("bank statement", "bank", "statement", "银行对账单", "对账单", "流水"),
+    "PURCHASE_INVOICE": ("purchase invoice", "supplier invoice", "purchase", "supplier", "vendor", "采购"),
     "SALES_INVOICE": ("sales", "invoice", "销售", "发票"),
     "RECEIPT": ("receipt", "收据", "小票"),
     "PAYMENT_PLATFORM_REPORT": ("stripe", "paypal", "settlement", "结算"),
-    "LOAN_STATEMENT": ("loan", "贷款"),
+    "LOAN_STATEMENT": ("loan statement", "loan", "贷款对账单", "贷款"),
+    "SUPPLIER_INVOICE": ("purchase", "supplier", "vendor", "采购"),
+    "CREDIT_NOTE": ("credit note", "贷项通知单", "贷项"),
+    "SALES_REPORT": ("sales report", "销售报表"),
+    "SETTLEMENT_REPORT": ("settlement report", "settlement", "结算报告", "结算"),
+    "PAYROLL_REPORT": ("payroll", "工资报表", "工资单"),
+    "EXPENSE_CLAIM": ("expense claim", "reimbursement", "报销"),
+    "FX_ADVICE": ("fx advice", "foreign exchange", "换汇", "汇兑"),
+    "PROGRESS_CLAIM": ("progress claim", "progress billing", "进度款申请", "进度款"),
+    "PAYMENT_CERTIFICATE": ("payment certificate", "付款证书", "付款证明"),
+    "OPEN_ITEMS_REGISTER": ("open items", "未结项", "未结清"),
 }
 cache = OrderedDict()
 lock = Lock()
@@ -46,9 +56,11 @@ def classify(body: AnalyzeRequest, key: str):
         if settings.classification_provider == "MOCK":
             items = []
             for doc, content in zip(body.documents, files, strict=True):
-                text = (doc.original_name + " " + content.decode("utf-8", errors="ignore")).casefold()
+                text = (doc.original_name + " " + content.decode("utf-8", errors="ignore")).casefold().replace("_", " ")
                 invalid = any(word in text for word in ("invalid", "unrelated", "无效"))
-                match = None if invalid else next((req for req in body.requirements if any(word in text for word in KEYWORDS.get(req.document_type, ()))), None)
+                scores = [(max((len(word) for word in KEYWORDS.get(req.document_type, ()) if word in text), default=0), req) for req in body.requirements]
+                score, candidate = max(scores, key=lambda item: item[0], default=(0, None))
+                match = candidate if score and not invalid else None
                 items.append({"document_id": str(doc.document_id), "category": "INVALID" if invalid else "REQUIREMENT" if match else "OTHER", "document_type": match.document_type if match else None, "requirement_id": str(match.id) if match else None, "confidence": 0.90 if match else 0.50})
             result = {"schema_version": "1", "run_id": str(body.run_id), "model_version": "mock-classifier-v1", "classifications": items}
         else:

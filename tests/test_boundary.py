@@ -134,6 +134,25 @@ def test_unexpected_error_never_leaks_secrets(document, monkeypatch, caplog):
         assert "sensitive" not in response.text + caplog.text
 
 
+@pytest.mark.parametrize("document_type", [
+    "PAYROLL_REPORT", "EXPENSE_CLAIM", "CREDIT_NOTE", "SALES_REPORT",
+    "SETTLEMENT_REPORT", "FX_ADVICE", "PROGRESS_CLAIM", "PAYMENT_CERTIFICATE",
+    "OPEN_ITEMS_REGISTER", "LOAN_STATEMENT", "PURCHASE_INVOICE",
+])
+def test_specific_document_types_do_not_match_generic_categories(document, monkeypatch, document_type):
+    from app.classification import classify
+    from app.schemas import AnalyzeRequest
+
+    monkeypatch.setattr(settings, "classification_provider", "MOCK")
+    monkeypatch.setattr(settings, "environment", "development")
+    types = ["BANK_STATEMENT", "SALES_INVOICE", "PAYMENT_PLATFORM_REPORT", document_type]
+    requirements = [{"id": uuid4(), "document_type": value, "title": value} for value in types]
+    body = AnalyzeRequest(run_id=uuid4(), purpose="CLASSIFY", documents=[document.model_copy(update={"original_name": document_type.lower() + ".pdf"})], requirements=requirements)
+    result = classify(body, f"{body.run_id}:0").classifications[0]
+    assert result.document_type == document_type
+    assert result.requirement_id == requirements[-1]["id"]
+
+
 def test_mock_classification_reads_full_file_and_replays(document, monkeypatch):
     from app.classification import classify
     from app.schemas import AnalyzeRequest
