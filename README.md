@@ -36,7 +36,7 @@ Set `REVIEW_PROVIDER=DISABLED|MOCK|REMOTE` (`AGENT_REVIEW_PROVIDER` in Compose).
 
 `app/analysis_schemas.py` defines the REVIEW contract and is kept identical in Backend. The remote POST uses the same complete-file transport as classification, plus request context, internal requirement hints, document associations, and up to three search turns. Agent returns `SEARCH_CURRENT/SEARCH_HISTORY`; only Backend searches authorized submitted documents and supplies the next turn. Final output must cover every supplied document and requirement. Amount operands carry document IDs and decimal strings; `SUM/SUBTRACT/MULTIPLY` allow multi-invoice, fee, conversion and retention relationships. Backend independently verifies arithmetic and evidence ownership.
 
-This release records suggestions only. Automatic item decisions, human evidence selection/override and notification outbox execution remain B6.4 work. The real trained model API is still unconfigured; REMOTE transport is provisional.
+Backend may automatically apply threshold-qualified `SATISFY` or `REQUEST_ACTION` item decisions after validating evidence and decimal arithmetic. Any automatic rejection returns the request to the client; an all-pass round remains `IN_REVIEW` until an accountant approves it. Human evidence override is supported, while waiver and whole-request approval remain human-only. Notification outbox records are currently suppressed rather than delivered. The real trained model API is still unconfigured; REMOTE transport is provisional.
 
 ## Publishing
 
