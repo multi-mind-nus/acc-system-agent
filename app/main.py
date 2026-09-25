@@ -13,10 +13,13 @@ from starlette.exceptions import HTTPException
 from app.config import settings
 from app.errors import AgentError
 from app.model_client import check_model_ready
+from app.deepseek import check_deepseek_ready
+from app.ocr import check_ocr_ready
 from app.schemas import AnalyzeRequest
 from app.classification import classify
 from app.analysis_schemas import ReviewRequest
 from app.review import review
+from app.inline import InlineClassifyRequest, InlineReviewRequest, decode_inline
 
 logger = logging.getLogger("agent.requests")
 logger.setLevel(logging.INFO)
@@ -83,8 +86,15 @@ def live():
 def ready():
     if not settings.document_path.is_dir():
         raise AgentError(503, "DOCUMENT_STORAGE_UNAVAILABLE", "Document storage is unavailable")
-    if settings.classification_provider == "MOCK" and settings.environment != "production":
+    providers = (settings.classification_provider, settings.review_provider)
+    if "MOCK" in providers and settings.environment == "production":
+        raise AgentError(503, "MOCK_NOT_ALLOWED", "Simulated analysis is disabled in production")
+    if "MOCK" in providers and all(provider in ("MOCK", "DISABLED") for provider in providers):
         return {"status": "ok", "provider": "MOCK"}
+    if "DEEPSEEK" in providers:
+        check_ocr_ready(settings)
+        check_deepseek_ready(settings)
+        return {"status": "ok", "dependencies": {"documents": "ok", "ocr": "ok", "model": "ok"}}
     check_model_ready(settings)
     return {"status": "ok", "dependencies": {"documents": "ok", "model": "ok"}}
 
@@ -98,3 +108,21 @@ def analyze(body: AnalyzeRequest | ReviewRequest, request: Request, idempotency_
         return classify(body, idempotency_key)
     if isinstance(body, ReviewRequest):
         return review(body, idempotency_key)
+
+
+@app.post("/v1/analyze-inline")
+def analyze_inline(body: InlineClassifyRequest | InlineReviewRequest, request: Request,
+                   idempotency_key: str = Header(min_length=1, max_length=128), authorization: str = Header(default="")):
+    """Stand-alone API for trusted callers; no shared volume or business database required."""
+    secret = settings.agent_api_key.get_secret_value()
+    if not secret:
+        raise AgentError(503, "AGENT_AUTH_NOT_CONFIGURED", "Standalone API is not configured")
+    from secrets import compare_digest
+    if not compare_digest(authorization, f"Bearer {secret}"):
+        raise AgentError(401, "UNAUTHORIZED", "Invalid API credentials")
+    request.state.run_id = str(body.run_id)
+    expected = f"{body.run_id}:{body.turn if body.purpose == 'REVIEW' else 0}"
+    if idempotency_key != expected:
+        raise AgentError(422, "INVALID_IDEMPOTENCY_KEY", "Idempotency key must match run_id:turn")
+    parsed, files = decode_inline(body)
+    return classify(parsed, idempotency_key, files) if body.purpose == "CLASSIFY" else review(parsed, idempotency_key, files)

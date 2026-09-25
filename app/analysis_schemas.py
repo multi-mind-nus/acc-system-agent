@@ -17,6 +17,8 @@ class ReviewFile(StrictModel):
     document_id: UUID
     storage_key: str = Field(min_length=1, max_length=200)
     content_type: Literal["application/pdf", "image/png", "image/jpeg"]
+    document_type: str | None = Field(default=None, max_length=64)
+    submission_round: int | None = Field(default=None, ge=1)
     sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     original_name: str = Field(max_length=255)
     requirement_ids: list[UUID] = Field(default_factory=list, max_length=100)
@@ -71,6 +73,7 @@ class ReviewRequest(StrictModel):
     schema_version: Literal["1"] = "1"
     run_id: UUID
     purpose: Literal["REVIEW"]
+    review_preference: Literal["CAUTIOUS", "STANDARD", "EFFICIENT"] = "STANDARD"
     turn: int = Field(default=0, ge=0, le=3)
     context: ReviewContext
     documents: list[ReviewFile] = Field(max_length=100)
@@ -134,7 +137,6 @@ class Finding(StrictModel):
     action: Literal["ASK_CLIENT", "RESOLVE", "ESCALATE"]
     suggested_decision: Literal["SATISFY", "REQUEST_ACTION"] | None
     issue_code: Literal["MISSING", "WRONG_PERIOD", "ENTITY_MISMATCH", "UNREADABLE", "INCOMPLETE", "OTHER"] | None
-    confidence: float = Field(ge=0, le=1, allow_inf_nan=False)
     entity_check: Literal["MATCH", "MISMATCH", "UNKNOWN"]
     period_check: Literal["MATCH", "MISMATCH", "UNKNOWN"]
     explanation: str = Field(min_length=1, max_length=2000)
@@ -178,7 +180,7 @@ def validate_review(body: ReviewRequest, result: object) -> ReviewResponse:
     if any(e.document_id not in doc_ids for f in output.findings for e in f.evidence):
         raise ValueError("Unknown evidence")
     if output.search:
-        if output.search.requirement_id not in req_ids or output.findings:
+        if output.search.requirement_id not in req_ids or output.findings or body.turn >= 3 or output.search in body.search_history:
             raise ValueError("Search response must not contain final findings")
     elif set(finding_ids) != req_ids or set(extracted_ids) != doc_ids:
         raise ValueError("Final review must cover every input requirement and document")

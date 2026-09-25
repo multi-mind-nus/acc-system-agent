@@ -8,6 +8,7 @@ from app.analysis_schemas import ReviewRequest, validate_review
 from app.config import settings
 from app.errors import AgentError
 from app.model_client import analyze_model
+from app.deepseek import review_with_deepseek
 from app.storage import read_document
 
 cache = OrderedDict()
@@ -36,7 +37,7 @@ def mock_review(body: ReviewRequest):
         if scenario == "B03" and not historical:
             code = "MISSING"
         finding = {"requirement_id": str(req.id), "action": "ASK_CLIENT" if code else "RESOLVE" if resolved else "ESCALATE", "suggested_decision": "REQUEST_ACTION" if code else "SATISFY" if resolved else None, "issue_code": code,
-            "confidence": 0.99 if code or resolved else 0.50, "entity_check": "MISMATCH" if code == "ENTITY_MISMATCH" else "UNKNOWN", "period_check": "MISMATCH" if code == "WRONG_PERIOD" else "UNKNOWN",
+            "entity_check": "MISMATCH" if code == "ENTITY_MISMATCH" else "UNKNOWN", "period_check": "MISMATCH" if code == "WRONG_PERIOD" else "UNKNOWN",
             "explanation": {"WRONG_PERIOD": "The simulated document period differs from the requested period.", "ENTITY_MISMATCH": "The simulated document belongs to a different entity.", "MISSING": "Supporting documents are missing in this simulation."}.get(code, "Simulated supporting evidence found; verify the source documents." if resolved else "No model connected; manual verification required."),
             "client_message": "Please provide documents for the requested period." if code == "WRONG_PERIOD" else "Please provide documents for the correct entity." if code == "ENTITY_MISMATCH" else "Please supply the missing supporting documents." if code else None,
             "evidence": [{"document_id": str(d.document_id), "relation": "CONTRADICTS" if code else "SUPPORTS", "reason": "Simulated evidence; verify the original document."} for d in supports], "amounts": []}
@@ -51,7 +52,7 @@ def mock_review(body: ReviewRequest):
     return {"schema_version": "1", "run_id": str(body.run_id), "model_version": "mock-reviewer-v1", "extractions": extractions, "findings": findings}
 
 
-def review(body: ReviewRequest, key: str):
+def review(body: ReviewRequest, key: str, supplied_files: list[bytes] | None = None):
     if key != f"{body.run_id}:{body.turn}":
         raise AgentError(422, "INVALID_IDEMPOTENCY_KEY", "Key must match run and turn")
     if settings.review_provider == "DISABLED":
@@ -68,13 +69,18 @@ def review(body: ReviewRequest, key: str):
                 raise AgentError(409, "IDEMPOTENCY_CONFLICT", "Key was used with a different request")
             return result
         files, total = [], 0
-        for doc in body.documents:
-            content = read_document(doc, settings)
+        for index, doc in enumerate(body.documents):
+            content = supplied_files[index] if supplied_files is not None else read_document(doc, settings)
             total += len(content)
             if total > 100 * 1024 * 1024:
                 raise AgentError(413, "BATCH_TOO_LARGE", "Review exceeds the document limit")
             files.append(content)
-        result = mock_review(body) if settings.review_provider == "MOCK" else analyze_model(body, files, key, settings)
+        if settings.review_provider == "MOCK":
+            result = mock_review(body)
+        elif settings.review_provider == "DEEPSEEK":
+            result = review_with_deepseek(body, files, settings)
+        else:
+            result = analyze_model(body, files, key, settings)
         try:
             output = validate_review(body, result)
         except ValueError:

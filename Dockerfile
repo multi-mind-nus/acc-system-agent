@@ -1,9 +1,10 @@
-FROM ghcr.io/astral-sh/uv:0.12.6 AS uv
-FROM python:3.12.11-slim
+FROM ghcr.io/astral-sh/uv:0.12.18-python3.12-trixie-slim
 ARG APP_VERSION=dev
 LABEL org.opencontainers.image.revision=${APP_VERSION}
 ENV APP_VERSION=${APP_VERSION} PATH=/app/.venv/bin:$PATH PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 UV_LINK_MODE=copy
-COPY --from=uv /uv /bin/uv
+# PDFium needs local substitutes for unembedded Latin and Chinese PDF fonts.
+RUN apt-get update && apt-get install -y --no-install-recommends fonts-liberation fonts-noto-cjk \
+    && rm -rf /var/lib/apt/lists/*
 RUN groupadd --gid 10001 app && useradd --uid 10001 --gid app app && mkdir -p /app /data/documents && chown app:app /app
 WORKDIR /app
 COPY pyproject.toml uv.lock ./

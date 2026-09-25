@@ -9,6 +9,7 @@ from pydantic import ValidationError
 from app.config import settings
 from app.errors import AgentError
 from app.model_client import require_model_config
+from app.deepseek import classify_with_deepseek
 from app.schemas import AnalyzeRequest, ClassificationResponse
 from app.storage import read_document
 
@@ -34,7 +35,7 @@ cache = OrderedDict()
 lock = Lock()
 
 
-def classify(body: AnalyzeRequest, key: str):
+def classify(body: AnalyzeRequest, key: str, supplied_files: list[bytes] | None = None):
     fingerprint = sha256(body.model_dump_json().encode()).hexdigest()
     # ponytail: serialize classification per process for bounded idempotent replay;
     # Backend persists completed runs. Use provider idempotency for multi-replica scale.
@@ -47,8 +48,8 @@ def classify(body: AnalyzeRequest, key: str):
         if settings.classification_provider == "MOCK" and settings.environment == "production":
             raise AgentError(503, "MOCK_NOT_ALLOWED", "Simulated classification is disabled in production")
         files, total = [], 0
-        for document in body.documents:
-            content = read_document(document, settings)
+        for index, document in enumerate(body.documents):
+            content = supplied_files[index] if supplied_files is not None else read_document(document, settings)
             total += len(content)
             if total > 100 * 1024 * 1024:
                 raise AgentError(413, "BATCH_TOO_LARGE", "Select a smaller batch of documents")
@@ -63,6 +64,8 @@ def classify(body: AnalyzeRequest, key: str):
                 match = candidate if score and not invalid else None
                 items.append({"document_id": str(doc.document_id), "category": "INVALID" if invalid else "REQUIREMENT" if match else "OTHER", "document_type": match.document_type if match else None, "requirement_id": str(match.id) if match else None, "confidence": 0.90 if match else 0.50})
             result = {"schema_version": "1", "run_id": str(body.run_id), "model_version": "mock-classifier-v1", "classifications": items}
+        elif settings.classification_provider == "DEEPSEEK":
+            result = classify_with_deepseek(body, files, settings)
         else:
             require_model_config(settings)
             if settings.classification_provider != "REMOTE":

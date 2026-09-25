@@ -11,17 +11,24 @@ class Settings(BaseSettings):
 
     app_version: str = "dev"
     environment: str = "development"
-    classification_provider: Literal["MOCK", "REMOTE", "DISABLED"] = "DISABLED"
-    review_provider: Literal["MOCK", "REMOTE", "DISABLED"] = "DISABLED"
+    classification_provider: Literal["MOCK", "REMOTE", "DEEPSEEK", "DISABLED"] = "DISABLED"
+    review_provider: Literal["MOCK", "REMOTE", "DEEPSEEK", "DISABLED"] = "DISABLED"
     document_path: Path = Path("/data/documents")
     max_document_bytes: int = Field(default=25 * 1024 * 1024, gt=0)
     model_api_url: str = ""
     model_health_url: str = ""
     model_api_key: SecretStr = SecretStr("")
+    model_name: str = "deepseek/deepseek-v4.1-flash"
+    ocr_api_url: str = ""
+    ocr_health_url: str = ""
+    ocr_api_key: SecretStr = SecretStr("")
+    ocr_model: str = "deepseek/deepseek-ocr-2"
+    novita_api_key: SecretStr = SecretStr("")
+    agent_api_key: SecretStr = SecretStr("")
     model_connect_timeout_seconds: float = Field(default=10, gt=0, le=30)
     model_request_timeout_seconds: float = Field(default=180, gt=0, le=300)
 
-    @field_validator("model_api_url", "model_health_url")
+    @field_validator("model_api_url", "model_health_url", "ocr_api_url", "ocr_health_url")
     @classmethod
     def validate_url(cls, value: str) -> str:
         if value:
