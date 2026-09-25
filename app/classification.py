@@ -2,6 +2,7 @@ import base64
 from collections import OrderedDict
 from hashlib import sha256
 from threading import Lock
+from time import perf_counter
 
 import httpx
 from pydantic import ValidationError
@@ -12,6 +13,7 @@ from app.model_client import require_model_config
 from app.deepseek import classify_with_deepseek
 from app.schemas import AnalyzeRequest, ClassificationResponse
 from app.storage import read_document
+from app.telemetry import elapsed_ms, event
 
 KEYWORDS = {
     "BANK_STATEMENT": ("bank statement", "bank", "statement", "银行对账单", "对账单", "流水"),
@@ -44,12 +46,24 @@ def classify(body: AnalyzeRequest, key: str, supplied_files: list[bytes] | None 
             previous_hash, output = cache[key]
             if previous_hash != fingerprint:
                 raise AgentError(409, "IDEMPOTENCY_CONFLICT", "Key was used with a different request")
+            event("analysis_reused", run_id=str(body.run_id), purpose="CLASSIFY")
             return output
         if settings.classification_provider == "MOCK" and settings.environment == "production":
             raise AgentError(503, "MOCK_NOT_ALLOWED", "Simulated classification is disabled in production")
+        event("analysis_started", run_id=str(body.run_id), purpose="CLASSIFY",
+              provider=settings.classification_provider, document_count=len(body.documents),
+              requirement_count=len(body.requirements))
         files, total = [], 0
         for index, document in enumerate(body.documents):
-            content = supplied_files[index] if supplied_files is not None else read_document(document, settings)
+            started = perf_counter()
+            try:
+                content = supplied_files[index] if supplied_files is not None else read_document(document, settings)
+            except AgentError as exc:
+                event("document_read", run_id=str(body.run_id), document_id=str(document.document_id),
+                      status="failed", error_code=exc.code, duration_ms=elapsed_ms(started))
+                raise
+            event("document_read", run_id=str(body.run_id), document_id=str(document.document_id),
+                  status="ok", size_bytes=len(content), duration_ms=elapsed_ms(started))
             total += len(content)
             if total > 100 * 1024 * 1024:
                 raise AgentError(413, "BATCH_TOO_LARGE", "Select a smaller batch of documents")
@@ -100,8 +114,15 @@ def classify(body: AnalyzeRequest, key: str, supplied_files: list[bytes] | None 
             if any(item.requirement_id and item.requirement_id not in requirements for item in output.classifications):
                 raise ValueError("Unknown requirement")
         except (ValueError, ValidationError):
+            event("classification_validation", run_id=str(body.run_id), status="failed")
             raise AgentError(502, "MODEL_INVALID_RESPONSE", "Invalid classification response") from None
+        event("classification_validation", run_id=str(body.run_id), status="ok", result_count=len(output.classifications))
+        for item in output.classifications:
+            event("classification_result", run_id=str(body.run_id), document_id=str(item.document_id),
+                  category=item.category, requirement_id=str(item.requirement_id) if item.requirement_id else None,
+                  document_type=item.document_type)
         cache[key] = (fingerprint, output)
         if len(cache) > 128:
             cache.popitem(last=False)
+        event("analysis_completed", run_id=str(body.run_id), purpose="CLASSIFY", status="ok")
         return output

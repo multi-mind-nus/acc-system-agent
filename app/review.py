@@ -3,6 +3,7 @@ from collections import OrderedDict
 from datetime import timedelta
 from hashlib import sha256
 from threading import Lock
+from time import perf_counter
 
 from app.analysis_schemas import ReviewRequest, validate_review
 from app.config import settings
@@ -10,6 +11,7 @@ from app.errors import AgentError
 from app.model_client import analyze_model
 from app.deepseek import review_with_deepseek
 from app.storage import read_document
+from app.telemetry import elapsed_ms, event
 
 cache = OrderedDict()
 lock = Lock()
@@ -67,10 +69,22 @@ def review(body: ReviewRequest, key: str, supplied_files: list[bytes] | None = N
             previous, result = cache[key]
             if previous != fingerprint:
                 raise AgentError(409, "IDEMPOTENCY_CONFLICT", "Key was used with a different request")
+            event("analysis_reused", run_id=str(body.run_id), purpose="REVIEW", turn=body.turn)
             return result
+        event("analysis_started", run_id=str(body.run_id), purpose="REVIEW", turn=body.turn,
+              provider=settings.review_provider, document_count=len(body.documents),
+              requirement_count=len(body.requirements))
         files, total = [], 0
         for index, doc in enumerate(body.documents):
-            content = supplied_files[index] if supplied_files is not None else read_document(doc, settings)
+            started = perf_counter()
+            try:
+                content = supplied_files[index] if supplied_files is not None else read_document(doc, settings)
+            except AgentError as exc:
+                event("document_read", run_id=str(body.run_id), document_id=str(doc.document_id),
+                      status="failed", error_code=exc.code, duration_ms=elapsed_ms(started))
+                raise
+            event("document_read", run_id=str(body.run_id), document_id=str(doc.document_id),
+                  status="ok", size_bytes=len(content), duration_ms=elapsed_ms(started))
             total += len(content)
             if total > 100 * 1024 * 1024:
                 raise AgentError(413, "BATCH_TOO_LARGE", "Review exceeds the document limit")
@@ -84,8 +98,20 @@ def review(body: ReviewRequest, key: str, supplied_files: list[bytes] | None = N
         try:
             output = validate_review(body, result)
         except ValueError:
+            event("review_validation", run_id=str(body.run_id), turn=body.turn, status="failed")
             raise AgentError(502, "MODEL_INVALID_RESPONSE", "Invalid review response") from None
+        event("review_validation", run_id=str(body.run_id), turn=body.turn, status="ok")
+        if output.search:
+            event("review_search", run_id=str(body.run_id), turn=body.turn,
+                  action=output.search.action, requirement_id=str(output.search.requirement_id))
+        for finding in output.findings:
+            event("review_finding", run_id=str(body.run_id), turn=body.turn,
+                  requirement_id=str(finding.requirement_id), action=finding.action,
+                  issue_code=finding.issue_code, suggested_decision=finding.suggested_decision,
+                  evidence_count=len(finding.evidence), amount_relation_count=len(finding.amounts))
         cache[key] = (fingerprint, output)
         if len(cache) > 128:
             cache.popitem(last=False)
+        event("analysis_completed", run_id=str(body.run_id), purpose="REVIEW", turn=body.turn,
+              status="ok", outcome="search" if output.search else "findings")
         return output

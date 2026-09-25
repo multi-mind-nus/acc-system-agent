@@ -14,10 +14,11 @@ from app import main
 from app import deepseek, ocr
 from app.analysis_schemas import ReviewRequest
 from app.config import settings
+from app.errors import AgentError
 
 
 @pytest.mark.parametrize("content_type", ["image/png", "application/pdf"])
-def test_ocr_precedes_flash_and_inline_api_is_standalone(tmp_path, monkeypatch, content_type):
+def test_ocr_precedes_flash_and_inline_api_is_standalone(tmp_path, monkeypatch, caplog, content_type):
     image = Image.new("RGB", (100, 100), "white")
     buffer = io.BytesIO()
     image.save(buffer, format="PNG" if content_type == "image/png" else "PDF")
@@ -30,6 +31,8 @@ def test_ocr_precedes_flash_and_inline_api_is_standalone(tmp_path, monkeypatch, 
     monkeypatch.setattr(settings, "ocr_api_key", SecretStr("ocr-secret"))
     monkeypatch.setattr(settings, "agent_api_key", SecretStr("agent-secret"))
     monkeypatch.setattr(settings, "document_path", tmp_path / "absent")
+    monkeypatch.setattr(main.logger, "propagate", True)
+    caplog.set_level("INFO", logger="agent.requests")
     calls = []
 
     def respond(request):
@@ -69,6 +72,32 @@ def test_ocr_precedes_flash_and_inline_api_is_standalone(tmp_path, monkeypatch, 
         body["requirements"].append(body["requirements"][0])
         assert client.post("/v1/analyze-inline", json=body, headers=headers).json()["code"] == "VALIDATION_ERROR"
     assert calls == (["ocr", "flash"] if content_type == "image/png" else ["ocr", "flash"])
+    records = [json.loads(record.message) for record in caplog.records if record.name == "agent.requests"]
+    events = {record["event"] for record in records if record.get("run_id") == run_id}
+    assert {"document_read", "ocr_page_finished", "ocr_document_finished", "model_call_finished",
+            "classification_result", "analysis_completed", "request_finished"} <= events
+    assert "ocr-secret" not in caplog.text and "flash-secret" not in caplog.text
+    assert "BANK STATEMENT UOB" not in caplog.text
+
+
+def test_ocr_failure_logs_page_result_without_secret(monkeypatch, caplog):
+    buffer = io.BytesIO()
+    Image.new("RGB", (41, 41), "blue").save(buffer, format="PNG")
+    monkeypatch.setattr(settings, "ocr_api_url", "https://ocr.test/v1/chat/completions")
+    monkeypatch.setattr(settings, "ocr_api_key", SecretStr("private-ocr-key"))
+    monkeypatch.setattr(main.logger, "propagate", True)
+    caplog.set_level("INFO", logger="agent.requests")
+    real_client = httpx.Client
+    monkeypatch.setattr(httpx, "Client", lambda **kw: real_client(
+        transport=httpx.MockTransport(lambda request: httpx.Response(503)), **kw))
+
+    with pytest.raises(AgentError, match="OCR service is unavailable"):
+        ocr.ocr_document(buffer.getvalue(), "image/png", settings, None, "test-run", "test-document")
+
+    records = [json.loads(record.message) for record in caplog.records if record.name == "agent.requests"]
+    assert any(record.get("event") == "ocr_page_finished" and record.get("error_code") == "OCR_UNAVAILABLE"
+               and record.get("provider_status") == 503 for record in records)
+    assert "private-ocr-key" not in caplog.text
 
 
 def test_review_uses_ocr_and_cannot_create_business_decisions(tmp_path, monkeypatch):

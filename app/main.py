@@ -1,7 +1,5 @@
-import json
 import logging
 import re
-from datetime import UTC, datetime
 from time import perf_counter
 from uuid import uuid4
 
@@ -20,12 +18,8 @@ from app.classification import classify
 from app.analysis_schemas import ReviewRequest
 from app.review import review
 from app.inline import InlineClassifyRequest, InlineReviewRequest, decode_inline
+from app.telemetry import elapsed_ms, event, logger
 
-logger = logging.getLogger("agent.requests")
-logger.setLevel(logging.INFO)
-logger.propagate = False
-if not logger.handlers:
-    logger.addHandler(logging.StreamHandler())
 # HTTP libraries otherwise log remote URLs; remote responses may contain secrets.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
@@ -34,6 +28,10 @@ app = FastAPI(title="acc-system-agent", version=settings.app_version)
 
 
 def error(request: Request, status: int, code: str, message: str):
+    request.state.error_code = code
+    if getattr(request.state, "run_id", None):
+        event("analysis_failed", run_id=request.state.run_id,
+              purpose=getattr(request.state, "purpose", None), error_code=code)
     return JSONResponse(status_code=status, content={
         "code": code, "message": message, "details": None,
         "request_id": request.state.request_id,
@@ -66,14 +64,11 @@ async def request_context(request: Request, call_next):
         # Do not log arbitrary exception strings: SDK errors may include secrets.
         response = error(request, 500, "INTERNAL_ERROR", "An unexpected error occurred")
     response.headers["X-Request-ID"] = request.state.request_id
-    logger.info(json.dumps({
-        "timestamp": datetime.now(UTC).isoformat(),
-        "request_id": request.state.request_id,
-        "method": request.method,
-        "status_code": response.status_code,
-        "duration_ms": round((perf_counter() - started) * 1000, 2),
-        "run_id": getattr(request.state, "run_id", None),
-    }))
+    if request.url.path not in ("/health/live", "/health/ready") or response.status_code >= 400:
+        event("request_finished", request_id=request.state.request_id, method=request.method,
+              status_code=response.status_code, duration_ms=elapsed_ms(started),
+              run_id=getattr(request.state, "run_id", None), purpose=getattr(request.state, "purpose", None),
+              error_code=getattr(request.state, "error_code", None))
     return response
 
 
@@ -102,6 +97,7 @@ def ready():
 @app.post("/v1/analyze")
 def analyze(body: AnalyzeRequest | ReviewRequest, request: Request, idempotency_key: str = Header(min_length=1, max_length=128)):
     request.state.run_id = str(body.run_id)
+    request.state.purpose = body.purpose
     if not re.fullmatch(re.escape(str(body.run_id)) + r":[0-9]{1,3}", idempotency_key):
         raise AgentError(422, "INVALID_IDEMPOTENCY_KEY", "Idempotency key must match run_id:turn")
     if body.purpose == "CLASSIFY":
@@ -121,6 +117,7 @@ def analyze_inline(body: InlineClassifyRequest | InlineReviewRequest, request: R
     if not compare_digest(authorization, f"Bearer {secret}"):
         raise AgentError(401, "UNAUTHORIZED", "Invalid API credentials")
     request.state.run_id = str(body.run_id)
+    request.state.purpose = body.purpose
     expected = f"{body.run_id}:{body.turn if body.purpose == 'REVIEW' else 0}"
     if idempotency_key != expected:
         raise AgentError(422, "INVALID_IDEMPOTENCY_KEY", "Idempotency key must match run_id:turn")

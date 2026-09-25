@@ -13,6 +13,8 @@ from PIL import Image, UnidentifiedImageError
 
 from app.config import Settings
 from app.errors import AgentError
+from app.telemetry import elapsed_ms, event
+from time import perf_counter
 
 MAX_PAGES = 20
 MAX_PIXELS = 16_000_000
@@ -99,19 +101,27 @@ def check_ocr_ready(settings: Settings):
         raise AgentError(503, "OCR_UNAVAILABLE", "OCR service is unavailable") from None
 
 
-def ocr_document(content: bytes, content_type: str, settings: Settings, deadline: float | None = None) -> str:
+def ocr_document(content: bytes, content_type: str, settings: Settings, deadline: float | None = None,
+                 run_id: str | None = None, document_id: str | None = None) -> str:
     require_ocr(settings)
     cache_key = (sha256(content).digest(), content_type, settings.ocr_model, settings.ocr_api_url)
     with _cache_lock:
         if cache_key in _cache:
             _cache.move_to_end(cache_key)
+            event("ocr_cache_hit", run_id=run_id, document_id=document_id, text_chars=len(_cache[cache_key]))
             return _cache[cache_key]
     headers = {"Authorization": f"Bearer {_key(settings)}"}
     deadline = deadline or monotonic() + settings.model_request_timeout_seconds - 10
     output = []
+    current_page = 0
+    page_started = perf_counter()
+    provider_status = None
     try:
         with httpx.Client(follow_redirects=False, trust_env=False) as client:
             for index, image in enumerate(_pages(content, content_type), start=1):
+                current_page, page_started, provider_status = index, perf_counter(), None
+                event("ocr_page_started", run_id=run_id, document_id=document_id, page=index,
+                      model=settings.ocr_model)
                 if monotonic() >= deadline:
                     raise AgentError(504, "OCR_TIMEOUT", "OCR processing timed out")
                 image.thumbnail((1800, 1800))
@@ -124,6 +134,7 @@ def ocr_document(content: bytes, content_type: str, settings: Settings, deadline
                 ]}], "max_tokens": 4096, "temperature": 0, "top_k": 0, "stream": False}
                 timeout = httpx.Timeout(min(60, max(1, deadline - monotonic())), connect=settings.model_connect_timeout_seconds)
                 with client.stream("POST", settings.ocr_api_url or DEFAULT_API_URL, json=payload, headers=headers, timeout=timeout) as response:
+                    provider_status = response.status_code
                     result = _read_json(response)
                 try:
                     choice = result["choices"][0]
@@ -135,9 +146,25 @@ def ocr_document(content: bytes, content_type: str, settings: Settings, deadline
                 output.append(f"[page {index}]\n{text.strip()}")
                 if sum(map(len, output)) > MAX_OCR_CHARS:
                     raise AgentError(413, "OCR_TEXT_LIMIT", "OCR text exceeds the analysis limit")
+                event("ocr_page_finished", run_id=run_id, document_id=document_id, page=index,
+                      status="ok", provider_status=provider_status, text_chars=len(text),
+                      duration_ms=elapsed_ms(page_started))
+                current_page = 0
+    except AgentError as exc:
+        if current_page:
+            event("ocr_page_finished", run_id=run_id, document_id=document_id, page=current_page,
+                  status="failed", provider_status=provider_status, error_code=exc.code,
+                  duration_ms=elapsed_ms(page_started))
+        raise
     except httpx.TimeoutException:
+        if current_page:
+            event("ocr_page_finished", run_id=run_id, document_id=document_id, page=current_page,
+                  status="failed", error_code="OCR_TIMEOUT", duration_ms=elapsed_ms(page_started))
         raise AgentError(504, "OCR_TIMEOUT", "OCR service timed out") from None
     except httpx.HTTPError:
+        if current_page:
+            event("ocr_page_finished", run_id=run_id, document_id=document_id, page=current_page,
+                  status="failed", error_code="OCR_UNAVAILABLE", duration_ms=elapsed_ms(page_started))
         raise AgentError(503, "OCR_UNAVAILABLE", "OCR service is unavailable") from None
     text = "\n\n".join(output)
     with _cache_lock:
