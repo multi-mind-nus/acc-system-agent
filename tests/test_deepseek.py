@@ -245,6 +245,103 @@ def test_reconciliation_retries_unproved_or_invalid_amounts(monkeypatch, bad_rel
     assert len(prompts) == 2 and "failed validation" in prompts[1]
 
 
+@pytest.mark.parametrize("analysis_type", ["DOCUMENT_REQUIREMENT_VALIDATION", "BANK_TRANSACTION_RECONCILIATION"])
+def test_statement_only_resolve_respects_structured_scope(monkeypatch, analysis_type):
+    run_id, req_id, doc_id = (str(uuid4()) for _ in range(3))
+    body = ReviewRequest.model_validate({
+        "run_id": run_id, "purpose": "REVIEW",
+        "context": {"entity_name": "Demo", "period": "2026-08-01", "submission_id": str(uuid4())},
+        "documents": [{"document_id": doc_id, "storage_key": "bank.jpg", "content_type": "image/jpeg",
+                       "sha256": "0" * 64, "original_name": "bank.jpg", "requirement_ids": [req_id]}],
+        "requirements": [{"id": req_id, "document_type": "BANK_STATEMENT", "title": "Check bank statement",
+                          "analysis_type": analysis_type,
+                          "instructions": "Check only holder and month; do not reconcile transactions.", "required": True}],
+    })
+    response = {"schema_version": "1", "run_id": run_id, "model_version": "test",
+                "extractions": [{"document_id": doc_id}], "findings": [{
+                    "requirement_id": req_id, "action": "RESOLVE", "suggested_decision": "SATISFY", "issue_code": None,
+                    "entity_check": "MATCH", "period_check": "MATCH", "explanation": "Holder and month match.",
+                    "evidence": [{"document_id": doc_id, "relation": "SUPPORTS", "reason": "Statement"}]}]}
+    calls = []
+    monkeypatch.setattr(deepseek, "ocr_document", lambda *args: "Demo bank statement August 2026")
+
+    def fake_flash(prompt, *args):
+        calls.append(prompt)
+        assert "structured analysis_type" in prompt
+        return response
+
+    monkeypatch.setattr(deepseek, "_flash", fake_flash)
+    if analysis_type == "DOCUMENT_REQUIREMENT_VALIDATION":
+        assert deepseek.review_with_deepseek(body, [b"bank"], settings)["findings"][0]["action"] == "RESOLVE"
+        assert len(calls) == 1
+    else:
+        with pytest.raises(AgentError, match="Reconciliation requires"):
+            deepseek.review_with_deepseek(body, [b"bank"], settings)
+        assert len(calls) == 3
+
+
+def test_partial_claim_gets_one_correction_then_manual_review(monkeypatch):
+    run, claim_req, receipt_req, claim, receipt = (str(uuid4()) for _ in range(5))
+    body = ReviewRequest.model_validate({
+        "run_id": run, "purpose": "REVIEW",
+        "context": {"entity_name": "Demo", "period": "2026-11-01", "submission_id": str(uuid4())},
+        "documents": [{"document_id": doc, "storage_key": doc, "original_name": "document.jpg", "content_type": "image/jpeg", "sha256": "0"*64,
+                       "document_type": kind, "requirement_ids": [req]} for doc,kind,req in
+                      [(claim,"EXPENSE_CLAIM",claim_req),(receipt,"RECEIPT",receipt_req)]],
+        "requirements": [{"id": req, "document_type": kind, "title": kind,
+                          "analysis_type": "DOCUMENT_REQUIREMENT_VALIDATION", "required": False}
+                         for req,kind in [(claim_req,"EXPENSE_CLAIM"),(receipt_req,"RECEIPT")]],
+    })
+    evidence = [{"document_id": receipt, "relation": "SUPPORTS", "reason": "Receipt"}]
+    response = {"schema_version": "1", "run_id": run, "model_version": "test",
+                "extractions": [{"document_id": claim, "amount": "10", "currency": "SGD"},
+                                {"document_id": receipt, "amount": "10", "currency": "SGD"}],
+                "findings": [{"requirement_id": claim_req, "action": "ASK_CLIENT", "suggested_decision": "REQUEST_ACTION",
+                              "issue_code": "INCOMPLETE", "requested_document_type": "EXPENSE_CLAIM",
+                              "entity_check": "MATCH", "period_check": "MATCH", "explanation": "No claim lines",
+                              "client_message": "Upload an itemized claim", "evidence": evidence},
+                             {"requirement_id": receipt_req, "action": "RESOLVE", "suggested_decision": "SATISFY",
+                              "issue_code": None, "entity_check": "MATCH", "period_check": "MATCH",
+                              "explanation": "Receipt matches total", "evidence": evidence}]}
+    calls = []
+
+    def flash(prompt, payload, *args):
+        if calls:
+            assert payload["previous_response"] == response
+            assert claim in payload["validation_error"]
+        calls.append(payload)
+        return response
+
+    monkeypatch.setattr(deepseek, "ocr_document", lambda *args: "Claim total SGD 10; no itemized lines")
+    monkeypatch.setattr(deepseek, "_flash", flash)
+    output = deepseek.review_with_deepseek(body, [b"claim", b"receipt"], settings)
+    assert len(calls) == 2
+    assert output["findings"][0]["action"] == "ASK_CLIENT"
+    assert output["findings"][1]["action"] == "ESCALATE"
+    assert all(row.get("transactions", []) == [] for row in output["extractions"])
+
+
+@pytest.mark.parametrize("first_code,expected_code", [("MODEL_INVALID_RESPONSE", "MODEL_INVALID_RESPONSE"),
+                                                      ("MODEL_UNAVAILABLE", "MODEL_UNAVAILABLE")])
+def test_invalid_response_timeout_is_not_a_retryable_outage(monkeypatch, first_code, expected_code):
+    run, req = str(uuid4()), str(uuid4())
+    body = ReviewRequest.model_validate({
+        "run_id": run, "purpose": "REVIEW", "documents": [],
+        "context": {"entity_name": "Demo", "period": "2026-11-01", "submission_id": str(uuid4())},
+        "requirements": [{"id": req, "document_type": "BANK_STATEMENT", "title": "Bank",
+                          "analysis_type": "BANK_TRANSACTION_RECONCILIATION", "required": True}],
+    })
+    failures = iter([AgentError(502, first_code, "first failure"), AgentError(504, "MODEL_TIMEOUT", "timeout")])
+
+    def flash(*args):
+        raise next(failures)
+
+    monkeypatch.setattr(deepseek, "_flash", flash)
+    with pytest.raises(AgentError) as error:
+        deepseek.review_with_deepseek(body, [], settings)
+    assert error.value.code == expected_code
+
+
 def test_entity_mismatch_cannot_contradict_cited_ocr(monkeypatch):
     run_id, req_id, doc_id = (str(uuid4()) for _ in range(3))
     body = ReviewRequest.model_validate({

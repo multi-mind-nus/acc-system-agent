@@ -70,7 +70,7 @@ def _flash(system: str, payload: dict, settings: Settings, deadline: float, thin
         {"role": "system", "content": system},
         {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)},
     ], "response_format": {"type": "json_object"},
-        "temperature": 0, "max_tokens": 16384, "stream": False}
+        "temperature": 0, "max_tokens": 32768 if thinking else 16384, "stream": False}
     if thinking:
         request["reasoning"] = {"effort": "low"}
     try:
@@ -156,7 +156,11 @@ def review_with_deepseek(body, files: list[bytes], settings: Settings) -> dict:
               "the scope of work, not facts: verify any named transaction against the statement itself. When a "
               "specific transaction is named, do not demand support for unrelated statement transactions. "
               "If no transaction is named, assess the full requested scope rather than guessing one. "
-              "For document-validation requirements, check the entity and period of the newest submitted round "
+              "The structured analysis_type defines the review mode. DOCUMENT_REQUIREMENT_VALIDATION checks "
+              "the requested document type, entity and period, including for BANK_STATEMENT; a valid statement "
+              "alone can satisfy it without invoices, transaction reconciliation or amount relations. "
+              "BANK_TRANSACTION_RECONCILIATION requires supporting evidence and amount relations; instructions "
+              "cannot waive those checks. For document-validation requirements, check the entity and period of the newest submitted round "
               "for that requirement (documents[].submission_round). An older rejected file remains visible for "
               "audit, but if the latest round includes a valid corrected replacement, do not reject merely because "
               "the older file was wrong; cite the corrected document. A clear mismatch in the latest applicable "
@@ -183,7 +187,13 @@ def review_with_deepseek(body, files: list[bytes], settings: Settings) -> dict:
               "when gross or deductions are documented. An open-items register is a ledger summary, not the underlying "
               "invoice or other source document; do not resolve a payment from bank plus register alone. "
               "When an EXPENSE_CLAIM is present, extract the claim total and every "
-              "expense line into the claim extraction's transactions. Match each line by amount and currency "
+              "expense line into the claim extraction's transactions (each item needs date, description, "
+              "amount and currency). If the claim OCR contains only a total "
+              "and no itemized lines, never invent lines or dates: ASK_CLIENT for a complete EXPENSE_CLAIM "
+              "with INCOMPLETE, and ESCALATE the receipt and bank requirements until it arrives. An incomplete "
+              "claim is a known defective document, not a reason to search for unrelated support. "
+              "Validate the newest claim submission for each requirement; keep older claims in extractions "
+              "for audit, but do not reuse their totals or require old rejected claims to reconcile. Match each line by amount and currency "
               "to a distinct original RECEIPT document; the claim's own line item is not a receipt. Only resolve "
               "the receipts, claim or related bank reconciliation when every line has its own receipt and cite "
               "the claim and all matching receipts in each related finding. If a receipt is absent, first "
@@ -210,6 +220,7 @@ def review_with_deepseek(body, files: list[bytes], settings: Settings) -> dict:
                "review_preference": body.review_preference,
                "context": body.context.model_dump(mode="json"), "requirements": [r.model_dump(mode="json") for r in body.requirements],
                "search_history": [s.model_dump(mode="json") for s in body.search_history], "documents": documents}
+    invalid_response = False
     for attempt in range(3):
         event("model_call_started", run_id=str(body.run_id), purpose="REVIEW", turn=body.turn,
               attempt=attempt + 1, model=settings.model_name)
@@ -219,8 +230,11 @@ def review_with_deepseek(body, files: list[bytes], settings: Settings) -> dict:
         except AgentError as exc:
             event("model_call_finished", run_id=str(body.run_id), purpose="REVIEW", turn=body.turn,
                   attempt=attempt + 1, status="failed", error_code=exc.code, duration_ms=elapsed_ms(started))
+            if exc.code == "MODEL_TIMEOUT" and invalid_response:
+                raise AgentError(502, "MODEL_INVALID_RESPONSE", "Model correction exhausted the review time budget") from None
             if exc.code != "MODEL_INVALID_RESPONSE" or attempt == 2:
                 raise
+            invalid_response = True
             prompt += "\nThe previous answer was not valid JSON. Return one complete JSON object."
             continue
         event("model_call_finished", run_id=str(body.run_id), purpose="REVIEW", turn=body.turn,
@@ -299,17 +313,38 @@ def review_with_deepseek(body, files: list[bytes], settings: Settings) -> dict:
                   attempt=attempt + 1, status="ok")
             return result
         except ValueError as exc:
+            invalid_response = True
             event("model_result_validation", run_id=str(body.run_id), turn=body.turn,
                   attempt=attempt + 1, status="failed",
                   error_code="SCHEMA_INVALID" if isinstance(exc, ValidationError) else "EVIDENCE_INVALID",
                   detail=None if isinstance(exc, ValidationError) else str(exc)[:150])
             reason = "schema" if isinstance(exc, ValidationError) else str(exc)
+            if attempt >= 1 and reason.startswith(("Expense claim", "Every expense claim line")):
+                # A valid response with unproved satisfaction can safely become
+                # manual review; never fabricate missing lines or relax evidence checks.
+                cautious = ReviewResponse.model_validate(result)
+                for finding in cautious.findings:
+                    if finding.suggested_decision == "SATISFY":
+                        finding.action, finding.suggested_decision = "ESCALATE", None
+                        finding.issue_code = "INCOMPLETE"
+                        finding.entity_check = finding.period_check = "UNKNOWN"
+                        finding.explanation = f"Automatic satisfaction blocked: {reason}. Accountant verification required."
+                        finding.client_message = finding.requested_document_type = None
+                        finding.amounts = []
+                        for evidence in finding.evidence:
+                            evidence.relation = "REFERENCE"
+                            evidence.reason = "Source requires accountant verification"
+                corrected = cautious.model_dump(mode="json")
+                validate_review(body, corrected)
+                event("model_result_validation", run_id=str(body.run_id), turn=body.turn,
+                      attempt=attempt + 1, status="manual_review_required")
+                return corrected
             if attempt == 2:
                 raise AgentError(502, "MODEL_INVALID_RESPONSE", f"Review response failed validation: {reason}") from None
             feedback = ("; ".join("/".join(map(str, error["loc"])) + ": " + error["type"]
                                   for error in exc.errors()[:3]) if isinstance(exc, ValidationError)
                         else str(exc))[:300]
-            payload = {**payload, "validation_error": feedback}
+            payload = {**payload, "validation_error": feedback, "previous_response": result}
             prompt += "\nYour previous response failed validation: " + feedback + ". Recheck the original evidence and return a complete corrected JSON object."
 
 

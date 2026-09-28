@@ -68,3 +68,14 @@ def test_expense_claim_requires_independent_receipt_for_each_line():
         validate_review(ReviewRequest.model_validate(complete_request), complete_output)
     complete_output["findings"][1]["amounts"][0]["operands"][1]["amount"] = "266.40"
     assert len(validate_review(ReviewRequest.model_validate(complete_request), complete_output).findings) == 3
+
+    # A rejected earlier claim remains visible without invalidating its replacement.
+    old_claim = str(uuid4())
+    complete_request["documents"][1]["submission_round"] = 2
+    complete_request["documents"].append({**document(old_claim, "EXPENSE_CLAIM", claim_req), "submission_round": 1})
+    complete_output["extractions"].append({"document_id": old_claim, "amount": "39.52", "currency": "SGD"})
+    assert len(validate_review(ReviewRequest.model_validate(complete_request), complete_output).findings) == 3
+    stale = deepcopy(complete_output)
+    stale["findings"][1]["evidence"].append({"document_id": old_claim, "relation": "SUPPORTS", "reason": "Old claim"})
+    with pytest.raises(ValueError, match="superseded"):
+        validate_review(ReviewRequest.model_validate(complete_request), stale)

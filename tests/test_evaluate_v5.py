@@ -9,6 +9,7 @@ from scripts import evaluate_v5
 
 @pytest.mark.parametrize("document_type,analysis_type", [
     ("BANK_STATEMENT", "BANK_TRANSACTION_RECONCILIATION"),
+    ("BANK_STATEMENT", "DOCUMENT_REQUIREMENT_VALIDATION"),
     ("SUPPLIER_INVOICE", "DOCUMENT_REQUIREMENT_VALIDATION"),
 ])
 def test_case_task_does_not_supply_review_facts(tmp_path, monkeypatch, document_type, analysis_type):
@@ -17,7 +18,7 @@ def test_case_task_does_not_supply_review_facts(tmp_path, monkeypatch, document_
     (tmp_path / "agent_input/task.json").write_text(json.dumps({
         "client_name": "Task name", "reporting_period": "2026-02",
         "instruction": "TASK_ONLY_SENTINEL", "initial_document_refs": ["bank.pdf"],
-        "task_type": "BANK_TRANSACTION_RECONCILIATION",
+        "task_type": analysis_type,
         "target_transaction": {"date": "2026-02-20", "description": "Vendor", "amount": "-SGD 8,498.05"},
     }))
     (tmp_path / "agent_input/client_profile.json").write_text(json.dumps({

@@ -71,7 +71,9 @@ def evaluate(case_dir: Path, phase: str, include_distractors: bool = True) -> di
             "id": str(requirement_id),
             "document_type": document_type,
             "title": "Case review",
-            "analysis_type": "BANK_TRANSACTION_RECONCILIATION" if document_type == "BANK_STATEMENT" else "DOCUMENT_REQUIREMENT_VALIDATION",
+            "analysis_type": task.get("task_type") or (
+                "BANK_TRANSACTION_RECONCILIATION" if document_type == "BANK_STATEMENT" else "DOCUMENT_REQUIREMENT_VALIDATION"
+            ),
             "required": True, "instructions": "",
         }],
         "search_history": [],

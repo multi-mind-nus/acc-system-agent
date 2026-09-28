@@ -179,7 +179,12 @@ def _validate_expense_receipts(body: ReviewRequest, output: ReviewResponse) -> N
     extractions = {row.document_id: row for row in output.extractions}
     document_types = {doc.document_id: doc.document_type or (extractions[doc.document_id].document_type
                       if doc.document_id in extractions else None) for doc in body.documents}
-    claims = [doc.document_id for doc in body.documents if document_types[doc.document_id] == "EXPENSE_CLAIM"]
+    claim_documents = [doc for doc in body.documents if document_types[doc.document_id] == "EXPENSE_CLAIM"]
+    claims = [doc.document_id for doc in claim_documents if not any(
+        set(doc.requirement_ids) & set(newer.requirement_ids)
+        and (newer.submission_round or 0) > (doc.submission_round or 0)
+        for newer in claim_documents
+    )]
     if not claims:
         return
     claim_requirements = {r.id for r in body.requirements if r.document_type == "EXPENSE_CLAIM"}
@@ -188,13 +193,16 @@ def _validate_expense_receipts(body: ReviewRequest, output: ReviewResponse) -> N
         or any(e.document_id in claims for e in finding.evidence))]
     if not relevant:
         return
+    superseded = {doc.document_id for doc in claim_documents} - set(claims)
+    if any(e.document_id in superseded and e.relation == "SUPPORTS" for f in relevant for e in f.evidence):
+        raise ValueError("Expense claim resolution cannot rely on a superseded submission")
     receipts = [doc.document_id for doc in body.documents if document_types[doc.document_id] == "RECEIPT"]
     used = set()
     matched_by_claim = {}
     for claim_id in claims:
         claim = extractions.get(claim_id)
         if not claim or not claim.amount or not claim.currency or not claim.transactions:
-            raise ValueError("Expense claim needs itemized lines before automatic satisfaction")
+            raise ValueError(f"Expense claim needs amount, currency and itemized transactions before automatic satisfaction: document_id={claim_id}")
         if any(row.currency != claim.currency or Decimal(row.amount) <= 0 for row in claim.transactions) \
                 or sum(Decimal(row.amount) for row in claim.transactions) != Decimal(claim.amount):
             raise ValueError("Expense claim lines do not reconcile to its total")
